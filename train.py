@@ -32,21 +32,25 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
+out_dir = 'ckpts'
 eval_interval = 2000
-log_interval = 1
+log_interval = 10
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
+checkpoint_iters = tuple(
+    [0] + np.unique((2 ** np.arange(0, 12.1, 1)).astype(int)).tolist() + \
+    np.arange(6000, 30000, 2000).tolist() + [28500, 29000, 29500, 30000]
+)
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'nanoGPT'
+wandb_run_name = 'gpt2-openwebtext' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 2 # used to simulate larger batch sizes
+batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -56,7 +60,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 30000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -64,7 +68,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 2000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -73,7 +77,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, tuple))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -98,8 +102,14 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
+
+# configure logging only in master process
+def print0(*args):
+    if master_process:
+        print(*args)
+
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+print0(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -113,13 +123,17 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+train_data = np.fromfile(os.path.join(data_dir, 'train.bin'), dtype=np.uint16)
+val_data = np.fromfile(os.path.join(data_dir, 'val.bin'), dtype=np.uint16)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        data = train_data
+        #data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        data = val_data
+        #data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
@@ -141,22 +155,22 @@ if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    print0(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
-    print("Initializing a new model from scratch")
+    print0("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        print0("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
+    print0(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -179,7 +193,7 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+    print0(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
@@ -203,7 +217,7 @@ checkpoint = None # free up memory
 
 # compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
+    print0("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
@@ -228,18 +242,27 @@ def estimate_loss():
     return out
 
 # learning rate decay scheduler (cosine with warmup)
+#def get_lr(it):
+#    # 1) linear warmup for warmup_iters steps
+#    if it < warmup_iters:
+#        return learning_rate * (it + 1) / (warmup_iters + 1)
+#    # 2) if it > lr_decay_iters, return min learning rate
+#    if it > lr_decay_iters:
+#        return min_lr
+#    # 3) in between, use cosine decay down to min learning rate
+#    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+#    assert 0 <= decay_ratio <= 1
+#    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+#    return min_lr + coeff * (learning_rate - min_lr)
+
+# warmup-stable-decay scheduler
 def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    if it >= max_iters - lr_decay_iters:
+        coeff = (max_iters - it - 1) / lr_decay_iters
+        return min_lr + coeff * (learning_rate - min_lr)
+    return learning_rate
 
 # logging
 if wandb_log and master_process:
@@ -260,16 +283,15 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    #if iter_num % eval_interval == 0 and master_process:
+    if iter_num in checkpoint_iters and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print0(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -282,8 +304,8 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                print0(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{iter_num:05d}.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -321,10 +343,20 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 0: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print0(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+        if wandb_log:
+            wandb.log({
+                "iter_num": iter_num,
+                "train/running_loss": lossf,
+                "lr": lr,
+                "time": dt,
+                "mfu": running_mfu * 100
+            })
+
     iter_num += 1
     local_iter_num += 1
 
