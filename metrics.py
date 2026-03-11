@@ -390,7 +390,7 @@ def top_eigenvalue_lobpcg(matvec, model, batches, precond=None,
         max_res = max(rel_res)
 
         if verbose:
-            eigs_str = ', '.join(f'{e:.4f}' for e in E.tolist())
+            eigs_str = ', '.join(f'{e if mode == 'top' else -e:.4f}' for e in E.tolist())
             print(f'Iter {i}: eigenvalues=[{eigs_str}], max_rel_res={max_res:.2e}')
 
         if max_res < tol:
