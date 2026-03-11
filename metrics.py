@@ -313,7 +313,8 @@ def top_and_bottom_eigenvalue(matvec, model, batches, precond=None,
 
 def top_eigenvalue_lobpcg(matvec, model, batches, precond=None,
                           k=1, max_iter=50, batches_per_iter=None,
-                          tol=1e-3, verbose=False, mode='top'):
+                          tol=1e-3, verbose=False, mode='top',
+                          return_max_res=False):
     """
     Estimate the top-k or bottom-k eigenvalues of a matrix defined by matvec
     using block subspace iteration (LOBPCG-style).
@@ -334,9 +335,11 @@ def top_eigenvalue_lobpcg(matvec, model, batches, precond=None,
         mode:             'top' (default) for largest eigenvalues in descending order;
                           'bottom' for smallest eigenvalues in ascending order
                           (implemented by negating the matvec and negating results)
+        return_max_res:   if True, also return the final max relative residual
     Returns:
         float if k==1, else list of k floats
         (descending order for mode='top', ascending order for mode='bottom')
+        If return_max_res=True, returns a tuple (eigenvalues, max_rel_res)
     """
     if callable(batches):
         assert batches_per_iter is not None, "batches_per_iter required when batches is callable"
@@ -419,9 +422,14 @@ def top_eigenvalue_lobpcg(matvec, model, batches, precond=None,
 
     if k == 1:
         result = E[0].item()
-        return -result if mode == 'bottom' else result
-    result = E[:k].tolist()
-    return [-e for e in result] if mode == 'bottom' else result
+        eigenvalues = -result if mode == 'bottom' else result
+    else:
+        result = E[:k].tolist()
+        eigenvalues = [-e for e in result] if mode == 'bottom' else result
+
+    if return_max_res:
+        return eigenvalues, max_res
+    return eigenvalues
 
 
 # ------------------------------------------------------------------ #
