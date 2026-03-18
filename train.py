@@ -49,6 +49,7 @@ wandb_project = 'nanoGPT'
 wandb_run_name = 'gpt2-openwebtext' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
+train_data_fraction = 1.0 # fraction of training data to use (1.0 = full dataset)
 gradient_accumulation_steps = 2 # used to simulate larger batch sizes
 batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -125,6 +126,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 train_data = np.fromfile(os.path.join(data_dir, 'train.bin'), dtype=np.uint16)
 val_data = np.fromfile(os.path.join(data_dir, 'val.bin'), dtype=np.uint16)
+if train_data_fraction < 1.0:
+    train_data = train_data[:int(len(train_data) * train_data_fraction)]
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
