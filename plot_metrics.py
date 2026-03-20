@@ -221,6 +221,54 @@ def plot4_max_res(all_data, iters, output_dir):
     make_plots(draw, 'plot4_max_res', output_dir)
 
 
+def plot6_solver_convergence(all_data, iters, output_dir, keys):
+    """Plot solver convergence diagnostics for all solvers present in the metrics files.
+
+    - ``*_cossim`` keys (power-iteration): final cosine similarity per run.
+    - ``*_max_res`` keys (LOBPCG): max relative residual per run.
+
+    Separate figures (linear + log x) are produced for each key type when present.
+    """
+    cossim_keys = sorted(k for k in keys if k.endswith('_cossim'))
+    max_res_keys = sorted(k for k in keys if k.endswith('_max_res'))
+
+    def _label(k):
+        return k.replace('_cossim', '').replace('_max_res', '').replace('_', ' ')
+
+    if cossim_keys:
+        data = {k: aggregate(all_data, k) for k in cossim_keys}
+
+        def draw_cossim(ax, xscale):
+            for i, k in enumerate(cossim_keys):
+                _, m, s = data[k]
+                plot_line(ax, iters, m, s, _label(k), COLORS[i % len(COLORS)])
+            add_vlines(ax)
+            ax.set_xscale(xscale)
+            if xscale == 'log':
+                ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
+                ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel('Cosine similarity (final step)')
+            ax.set_title('Solver convergence: cosine similarity')
+            ax.legend(fontsize=9)
+
+        make_plots(draw_cossim, 'plot6_cossim', output_dir)
+
+    if max_res_keys:
+        data = {k: aggregate(all_data, k) for k in max_res_keys}
+
+        def draw_max_res(ax, xscale):
+            for i, k in enumerate(max_res_keys):
+                _, m, s = data[k]
+                plot_line(ax, iters, m, s, _label(k), COLORS[i % len(COLORS)])
+            add_vlines(ax)
+            style_axes(ax, xscale, ylabel='Max relative residual')
+            ax.set_title('Solver convergence: max residual (LOBPCG)')
+            ax.legend(fontsize=9)
+
+        make_plots(draw_max_res, 'plot6_max_res', output_dir)
+
+
 def plot5_loss_hessian_ridge(all_data, output_dir):
     """Ridge histplot of the loss-Hessian spectrum; log-scale x-axis."""
     all_iters = sorted(all_data.keys())
@@ -342,7 +390,12 @@ def main():
         plot3_hessian_top_bottom(all_data, iters, output_dir)
     else:
         print("  skipping plot3_hessian_top_bottom (key 'hessian_precond_bottom' not found)")
-    #plot4_max_res(all_data, iters, output_dir)
+    has_cossim = any(k.endswith('_cossim') for k in avail)
+    has_max_res = any(k.endswith('_max_res') for k in avail)
+    if has_cossim or has_max_res:
+        plot6_solver_convergence(all_data, iters, output_dir, avail)
+    else:
+        print("  skipping plot6_solver_convergence (no _cossim or _max_res keys found)")
     if 'loss_hessian_spectrum' in avail:
         plot5_loss_hessian_ridge(all_data, output_dir)
     else:

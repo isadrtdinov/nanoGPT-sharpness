@@ -91,6 +91,8 @@ def parse_args():
     parser.add_argument('--num_batches', type=int, default=16,
                         help='Number of batches averaged per metric estimate')
     parser.add_argument('--num_trials', type=int, default=1)
+    parser.add_argument('--train_data_fraction', type=float, default=1.0,
+                        help='Fraction of training data to use (mirrors train.py behavior)')
 
     # Loss hessian spectrum
     parser.add_argument('--loss_hessian_k', type=int, default=1024)
@@ -169,6 +171,7 @@ def save_config(args):
         split=args.split,
         ckpt_dir=args.ckpt_dir,
         data_dir=args.data_dir,
+        train_data_fraction=args.train_data_fraction,
     )
     with open(config_filename(args.output_dir), 'w') as f:
         json.dump(config, f, indent=2)
@@ -236,6 +239,8 @@ def make_get_batch(args, device):
     def get_batch():
         data = np.memmap(os.path.join(args.data_dir, f'{args.split}.bin'),
                          dtype=np.uint16, mode='r')
+        if args.split == 'train' and args.train_data_fraction < 1.0:
+            data = data[:int(len(data) * args.train_data_fraction)]
         ix = torch.randint(len(data) - args.block_size, (args.batch_size,))
         x = torch.stack([torch.from_numpy(data[i:i+args.block_size].astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy(data[i+1:i+1+args.block_size].astype(np.int64)) for i in ix])
