@@ -19,10 +19,10 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # LR scheduler (mirrors train.py warmup-stable-decay)
 # ---------------------------------------------------------------------------
-LEARNING_RATE = 6e-4
-MIN_LR = 6e-5
+LEARNING_RATE = 1e-5
+MIN_LR = 1e-6
 WARMUP_ITERS = 2000
-MAX_ITERS = 30000
+MAX_ITERS = 10000
 LR_DECAY_ITERS = 2000        # decay starts at MAX_ITERS - LR_DECAY_ITERS = 28000
 BETA1 = 0.9
 
@@ -93,7 +93,7 @@ def plot_line(ax, x, mean, std, label, color, lw=1.8):
     ax.fill_between(x, mean - std, mean + std, alpha=0.18, color=color)
 
 
-LOSS_DECEL_ITER = 3000
+LOSS_DECEL_ITER = 1
 
 VLINES = [
     (WARMUP_ITERS,                   'End warmup',    'steelblue',  ':'),
@@ -152,15 +152,23 @@ def plot1_precond_eigenvalues(all_data, iters, output_dir, keys=None):
     """Top precond-Hessian and (if available) top precond-GN eigenvalues."""
     if keys is None:
         keys = available_keys(all_data)
-    _, ht_m, ht_s = aggregate(all_data, 'hessian_precond_top')
+    has_ht = 'hessian_precond_top' in keys
+    if has_ht:
+        _, ht_m, ht_s = aggregate(all_data, 'hessian_precond_top')
     has_gn = 'gn_precond_top' in keys
     if has_gn:
         _, gn_m, gn_s = aggregate(all_data, 'gn_precond_top')
+    has_cupy = 'hessian_precond_cupy_top' in keys
+    if has_cupy:
+        _, cupy_m, cupy_s = aggregate(all_data, 'hessian_precond_cupy_top')
 
     def draw(ax, xscale):
-        plot_line(ax, iters, ht_m, ht_s, 'Hessian precond top', COLORS[0])
+        if has_ht:
+            plot_line(ax, iters, ht_m, ht_s, 'Hessian precond top', COLORS[0])
         if has_gn:
             plot_line(ax, iters, gn_m, gn_s, 'GN precond top', COLORS[1])
+        if has_cupy:
+            plot_line(ax, iters, cupy_m, cupy_s, 'Hessian precond top (cupy LOBPCG)', COLORS[4])
         add_bound(ax, iters)
         add_vlines(ax)
         style_axes(ax, xscale)
@@ -226,14 +234,17 @@ def plot6_solver_convergence(all_data, iters, output_dir, keys):
 
     - ``*_cossim`` keys (power-iteration): final cosine similarity per run.
     - ``*_max_res`` keys (LOBPCG): max relative residual per run.
+    - ``*_residual`` keys (cupy LOBPCG): best absolute residual per run.
 
     Separate figures (linear + log x) are produced for each key type when present.
     """
     cossim_keys = sorted(k for k in keys if k.endswith('_cossim'))
     max_res_keys = sorted(k for k in keys if k.endswith('_max_res'))
+    residual_keys = sorted(k for k in keys if k.endswith('_residual'))
 
     def _label(k):
-        return k.replace('_cossim', '').replace('_max_res', '').replace('_', ' ')
+        return (k.replace('_cossim', '').replace('_max_res', '')
+                 .replace('_residual', '').replace('_', ' '))
 
     if cossim_keys:
         data = {k: aggregate(all_data, k) for k in cossim_keys}
@@ -267,6 +278,20 @@ def plot6_solver_convergence(all_data, iters, output_dir, keys):
             ax.legend(fontsize=9)
 
         make_plots(draw_max_res, 'plot6_max_res', output_dir)
+
+    if residual_keys:
+        data = {k: aggregate(all_data, k) for k in residual_keys}
+
+        def draw_residual(ax, xscale):
+            for i, k in enumerate(residual_keys):
+                _, m, s = data[k]
+                plot_line(ax, iters, m, s, _label(k), COLORS[i % len(COLORS)])
+            add_vlines(ax)
+            style_axes(ax, xscale, ylabel='Residual')
+            ax.set_title('Solver convergence: residual (cupy LOBPCG)')
+            ax.legend(fontsize=9)
+
+        make_plots(draw_residual, 'plot6_residual', output_dir)
 
 
 def plot5_loss_hessian_ridge(all_data, output_dir):
@@ -392,10 +417,11 @@ def main():
         print("  skipping plot3_hessian_top_bottom (key 'hessian_precond_bottom' not found)")
     has_cossim = any(k.endswith('_cossim') for k in avail)
     has_max_res = any(k.endswith('_max_res') for k in avail)
-    if has_cossim or has_max_res:
+    has_residual = any(k.endswith('_residual') for k in avail)
+    if has_cossim or has_max_res or has_residual:
         plot6_solver_convergence(all_data, iters, output_dir, avail)
     else:
-        print("  skipping plot6_solver_convergence (no _cossim or _max_res keys found)")
+        print("  skipping plot6_solver_convergence (no _cossim, _max_res, or _residual keys found)")
     if 'loss_hessian_spectrum' in avail:
         plot5_loss_hessian_ridge(all_data, output_dir)
     else:

@@ -32,12 +32,14 @@ Usage:
     python compute_metrics.py --metrics hessian gn_top --solver lobpcg --return_max_res
 
 Available metrics:
-    hessian         -- top and bottom eigenvalues of the full Hessian
-    hessian_precond -- top and bottom eigenvalues of the Adam-preconditioned Hessian
-    gn_top          -- top eigenvalue of the Gauss-Newton matrix
-    gn_precond_top  -- top eigenvalue of the Adam-preconditioned Gauss-Newton matrix
-    jtj_top         -- top eigenvalue of J^T J
-    loss_hessian    -- top-k eigenvalues of the cross-entropy Hessian w.r.t. logits
+    hessian                   -- top and bottom eigenvalues of the full Hessian
+    hessian_precond           -- top and bottom eigenvalues of the Adam-preconditioned Hessian
+    gn_top                    -- top eigenvalue of the Gauss-Newton matrix
+    gn_precond_top            -- top eigenvalue of the Adam-preconditioned Gauss-Newton matrix
+    jtj_top                   -- top eigenvalue of J^T J
+    loss_hessian              -- top-k eigenvalues of the cross-entropy Hessian w.r.t. logits
+    hessian_precond_cupy_top  -- top eigenvalue of the Adam-preconditioned Hessian via
+                                 cupy LOBPCG over a bf16 functional-call HVP (sharpness_cupy_utils.py)
 """
 
 import os
@@ -56,7 +58,8 @@ from metrics import (
 )
 
 
-AVAILABLE_METRICS = ['hessian', 'hessian_precond', 'gn_top', 'gn_precond_top', 'jtj_top', 'loss_hessian']
+AVAILABLE_METRICS = ['hessian', 'hessian_precond', 'gn_top', 'gn_precond_top', 'jtj_top', 'loss_hessian',
+                     'hessian_precond_cupy_top']
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +119,12 @@ def parse_args():
     parser.add_argument('--return_max_res', action='store_true', default=False,
                         help='(lobpcg) Store per-run max relative residual in output .pt file')
 
+    # CuPy LOBPCG config (hessian_precond_cupy_top)
+    parser.add_argument('--cupy_lobpcg_tol', type=float, default=1e-9,
+                        help='(hessian_precond_cupy_top) Relative residual tolerance for cupy LOBPCG')
+    parser.add_argument('--cupy_lobpcg_max_iters', type=int, default=1000,
+                        help='(hessian_precond_cupy_top) Max outer iterations for cupy LOBPCG')
+
     # Model config
     parser.add_argument('--n_layer', type=int, default=12)
     parser.add_argument('--n_head', type=int, default=12)
@@ -168,6 +177,8 @@ def save_config(args):
         return_cossim=args.return_cossim,
         lobpcg_tol=args.lobpcg_tol,
         return_max_res=args.return_max_res,
+        cupy_lobpcg_tol=args.cupy_lobpcg_tol,
+        cupy_lobpcg_max_iters=args.cupy_lobpcg_max_iters,
         split=args.split,
         ckpt_dir=args.ckpt_dir,
         data_dir=args.data_dir,
@@ -259,6 +270,36 @@ def sample_batches(get_batch, num_batches):
 
 def _jtj_matvec(model, inputs, targets, v):
     return gn_matvec(model, inputs, targets, v, loss_hessian=False)
+
+
+def _compute_hessian_precond_cupy_top(model, precond_list, batches, args):
+    """
+    Top eigenvalue of P_inv^{1/2} H P_inv^{1/2} via cupy LOBPCG over the bf16
+    functional-call HVP in sharpness_cupy_utils.py.
+
+    metrics.precond_vector returns P_inv = 1 / ((sqrt(v/(1-b2^t)) + eps)(1-b1^t))
+    (the Adam-update multiplier on the gradient). sharpness_cupy_utils.compute_hvp
+    expects P = Adam denominator and applies v / P.sqrt() on both sides. Passing
+    P = 1/P_inv reproduces the metrics.py preconditioning convention.
+    """
+    try:
+        from sharpness_cupy_utils import create_hvp_operator_avg, lobpcg_solver
+    except ImportError as e:
+        raise RuntimeError(
+            'hessian_precond_cupy_top requires cupy + cupyx (install cupy-cudaXX matching '
+            f'your CUDA version). Original error: {e}'
+        )
+
+    from torch.nn.utils import parameters_to_vector
+    P_inv_flat = parameters_to_vector(precond_list).detach()
+    P_flat = 1.0 / P_inv_flat
+
+    hvp_op, num_params = create_hvp_operator_avg(model, batches, P=P_flat)
+    sharpness, _, residual, num_iters = lobpcg_solver(
+        hvp_op, num_params, eigvecs=None,
+        tol=args.cupy_lobpcg_tol, max_iters=args.cupy_lobpcg_max_iters,
+    )
+    return sharpness, residual, num_iters
 
 
 def compute_metrics_single(model, precond, batches, args):
@@ -383,6 +424,15 @@ def compute_metrics_single(model, precond, batches, args):
             if args.return_max_res:
                 metrics['jtj_top_max_res'] = torch.tensor(res)
 
+    # Solver-independent: ships its own cupy LOBPCG.
+    if 'hessian_precond_cupy_top' in requested:
+        if precond is None:
+            raise RuntimeError('hessian_precond_cupy_top requires Adam state in the checkpoint.')
+        val, residual, num_iters = _compute_hessian_precond_cupy_top(model, precond, batches, args)
+        metrics['hessian_precond_cupy_top'] = torch.tensor(val)
+        metrics['hessian_precond_cupy_top_residual'] = torch.tensor(residual)
+        metrics['hessian_precond_cupy_top_num_iters'] = torch.tensor(num_iters)
+
     # Loss hessian is solver-independent (uses Lanczos)
     if 'loss_hessian' in requested:
         all_logits = []
@@ -470,7 +520,7 @@ def main():
 
         # Print summary of computed scalar metrics
         summary_keys = ['hessian_top', 'hessian_bottom', 'hessian_precond_top', 'hessian_precond_bottom',
-                        'gn_top', 'gn_precond_top', 'jtj_top']
+                        'gn_top', 'gn_precond_top', 'jtj_top', 'hessian_precond_cupy_top']
         parts = [f'{k}={metrics[k]:.4f}' for k in summary_keys if k in metrics]
         if parts:
             print(f'  {", ".join(parts)}')
