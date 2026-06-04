@@ -43,6 +43,7 @@ checkpoint_iters = tuple(
     np.arange(6000, 30000, 2000).tolist() + [28500, 29000, 29500, 30000]
 )
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+resume_iter = -1 # if init_from='resume', which iteration checkpoint to load (-1 = latest available)
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'nanoGPT'
@@ -173,9 +174,17 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
-    print0(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    # resume training from a checkpoint matching ckpt-{iter:05d}.pt
+    if resume_iter < 0:
+        import glob, re
+        ckpt_files = glob.glob(os.path.join(out_dir, 'ckpt-*.pt'))
+        iters = [int(m.group(1)) for f in ckpt_files
+                 if (m := re.search(r'ckpt-(\d+)\.pt$', f))]
+        assert iters, f"No ckpt-*.pt files found in {out_dir}"
+        resume_iter = max(iters)
+    ckpt_path = os.path.join(out_dir, f'ckpt-{resume_iter:05d}.pt')
+    print0(f"Resuming training from {ckpt_path}")
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
